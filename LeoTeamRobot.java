@@ -1,138 +1,157 @@
-package grupp;
+package grupp5;
 
 import robocode.*;
 import robocode.util.Utils;
 
 import java.awt.Color;
 import java.awt.geom.Line2D;
-import java.awt.geom.Point2D;
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
+import java.io.Serializable;
+import java.util.ArrayList;
 
 /**
- * LeoTeamRobot - lagets "Livvakt".
+ * LeoTeamRobot - lagets Livvakt.
  *
- * Roll i laget:
- *  - Har radar och delar allt den ser med laget (EnemyPosition).
- *  - Håller sig nära ledaren (PeterTeamRobot), som har mest energi och är viktigast.
- *  - Skjuter på den fiende som är NÄRMAST LEDAREN, alltså det största hotet mot honom,
- *    i stället för lagets gemensamma mål.
- *  - Om ledaren är död: blir en vanlig krigare och skjuter på lagets gemensamma mål.
+ * Håller sig nära ledaren (PeterTeamRobot), på den sida där hotet finns,
+ * och skjuter på motståndaren som är närmast ledaren.
+ * Har Leo blivit träffad många gånger, eller är ledaren död, slutar han vakta
+ * och slåss som en vanlig krigare i stället.
+ * Alla vinklar är i grader.
  */
 public class LeoTeamRobot extends TeamRobot {
 
-    /** Ledarens klassnamn. Hans robotnamn i striden innehåller den här texten. */
-    private static final String LEADER_CLASS = "PeterTeamRobot";
-    /** Avståndet till ledaren som livvakten försöker hålla (pixlar). */
-    private static final double GUARD_DISTANCE = 120;
-    private static final int MAX_ENEMY_AGE = 30;
-    private static final double TEAMMATE_SAFETY_DISTANCE = 40;
-    private static final double WALL_MARGIN = 60;
+    private static final String LEADER_NAME = "PeterTeamRobot"; // ingår i ledarens namn i striden
+    private static final double WALL_MARGIN = 60;        // pixlar från väggen
+    private static final double SAFETY_DISTANCE = 40;    // pixlar från skottlinjen
+    private static final int MAX_ENEMY_AGE = 30;         // turer
+    private static final double GUARD_DISTANCE = 120;    // avstånd till ledaren
+    private static final int MAX_HITS_AS_GUARD = 4;      // sedan slutar vi vakta
 
-    private final Map<String, Point2D.Double> teammates = new HashMap<>();
-    private final Map<String, EnemyPosition> enemies = new HashMap<>();
-
-    private int moveDirection = 1;
+    // ---------- Minne ----------
+    private final ArrayList<EnemyInfo> enemies = new ArrayList<>();
+    private final ArrayList<TeammateInfo> teammates = new ArrayList<>();
+    private int moveDirection = 1;   // 1 = framåt, -1 = bakåt
+    private int hitsTaken = 0;       // antal träffar denna runda, se isGuarding()
 
     @Override
     public void run() {
-        setColors(new Color(20, 50, 140), Color.CYAN, Color.WHITE);
-
-        setAdjustGunForRobotTurn(true);
-        setAdjustRadarForGunTurn(true);
-        setAdjustRadarForRobotTurn(true);
-
+        setUp();
         while (true) {
             setTurnRadarRight(Double.POSITIVE_INFINITY);
+            shareWithTeam(new TeammateInfo(getName(), getX(), getY()));
 
-            sendToTeam(new TeammatePosition(getX(), getY()));
-
-            Point2D.Double leader = findLeader();
-            EnemyPosition target = chooseTarget(leader);
-
+            TeammateInfo leader = findLeader();
+            EnemyInfo target = chooseTarget(leader);
             if (target != null) {
                 aimAndFire(target);
             }
-
-            if (avoidWalls()) {
-                // väggen först
-            } else if (leader != null) {
-                guard(leader, target);
-            } else if (target != null) {
-                circle(target);
-            } else {
-                setTurnRight(20);
-                setAhead(50);
-            }
-
+            move(leader, target);
             execute();
         }
     }
 
     // ======================================================================
-    //  Händelser
+    //  Händelser - korta, anropar våra egna metoder
     // ======================================================================
 
     @Override
     public void onScannedRobot(ScannedRobotEvent e) {
         if (isTeammate(e.getName())) {
-            return;
+            return;   // aldrig ett mål
         }
-
-        double absoluteBearing = getHeadingRadians() + e.getBearingRadians();
-        double enemyX = getX() + e.getDistance() * Math.sin(absoluteBearing);
-        double enemyY = getY() + e.getDistance() * Math.cos(absoluteBearing);
-
-        EnemyPosition seen = new EnemyPosition(e.getName(), enemyX, enemyY,
-                e.getHeadingRadians(), e.getVelocity(), e.getEnergy(), getTime());
-
-        enemies.put(seen.name(), seen);
-        sendToTeam(seen);
+        EnemyInfo enemy = createEnemyInfo(e);
+        updateEnemy(enemy);
+        shareWithTeam(enemy);
     }
 
     @Override
     public void onMessageReceived(MessageEvent e) {
-        Object message = e.getMessage();
-
-        if (message instanceof TeammatePosition p) {
-            teammates.put(e.getSender(), new Point2D.Double(p.x(), p.y()));
-
-        } else if (message instanceof EnemyPosition enemy) {
-            EnemyPosition old = enemies.get(enemy.name());
-            if (old == null || enemy.time() > old.time()) {
-                enemies.put(enemy.name(), enemy);
-            }
+        if (e.getMessage() instanceof EnemyInfo) {
+            updateEnemy((EnemyInfo) e.getMessage());
+        } else if (e.getMessage() instanceof TeammateInfo) {
+            updateTeammate((TeammateInfo) e.getMessage());
         }
     }
 
     @Override
-    public void onRobotDeath(RobotDeathEvent e) {
-        enemies.remove(e.getName());
-        teammates.remove(e.getName());
-    }
-
-    @Override
     public void onHitByBullet(HitByBulletEvent e) {
-        moveDirection = -moveDirection;
-    }
-
-    @Override
-    public void onHitWall(HitWallEvent e) {
-        moveDirection = -moveDirection;
+        hitsTaken++;          // efter MAX_HITS_AS_GUARD träffar slutar vi vakta
+        reverseDirection();
     }
 
     @Override
     public void onHitRobot(HitRobotEvent e) {
-        moveDirection = -moveDirection;
-        setAhead(80 * moveDirection);
+        reverseDirection();
     }
 
     @Override
-    public void onWin(WinEvent e) {
-        for (int i = 0; i < 20; i++) {
-            turnRight(30);
-            turnLeft(30);
+    public void onHitWall(HitWallEvent e) {
+        reverseDirection();
+    }
+
+    @Override
+    public void onRobotDeath(RobotDeathEvent e) {
+        removeRobot(e.getName());
+    }
+
+    // ======================================================================
+    //  Inställningar
+    // ======================================================================
+
+    private void setUp() {
+        setColors(new Color(20, 50, 140), Color.CYAN, Color.WHITE);
+        setAdjustGunForRobotTurn(true);
+        setAdjustRadarForGunTurn(true);
+        setAdjustRadarForRobotTurn(true);
+    }
+
+    // ======================================================================
+    //  Minne: listorna med motståndare och lagkamrater
+    // ======================================================================
+
+    private EnemyInfo createEnemyInfo(ScannedRobotEvent e) {
+        double angle = Math.toRadians(getHeading() + e.getBearing());
+        double x = getX() + e.getDistance() * Math.sin(angle);
+        double y = getY() + e.getDistance() * Math.cos(angle);
+        return new EnemyInfo(e.getName(), x, y, e.getHeading(),
+                e.getVelocity(), e.getEnergy(), getTime());
+    }
+
+    private void updateEnemy(EnemyInfo enemy) {
+        for (int i = 0; i < enemies.size(); i++) {
+            if (enemies.get(i).getName().equals(enemy.getName())) {
+                if (enemy.getLastSeen() > enemies.get(i).getLastSeen()) {
+                    enemies.set(i, enemy);
+                }
+                return;
+            }
+        }
+        enemies.add(enemy);
+    }
+
+    private void updateTeammate(TeammateInfo teammate) {
+        if (teammate.getName().equals(getName())) {
+            return;   // vår egen position: då skulle vi aldrig våga skjuta
+        }
+        for (int i = 0; i < teammates.size(); i++) {
+            if (teammates.get(i).getName().equals(teammate.getName())) {
+                teammates.set(i, teammate);
+                return;
+            }
+        }
+        teammates.add(teammate);
+    }
+
+    private void removeRobot(String name) {
+        for (int i = enemies.size() - 1; i >= 0; i--) {
+            if (enemies.get(i).getName().equals(name)) {
+                enemies.remove(i);
+            }
+        }
+        for (int i = teammates.size() - 1; i >= 0; i--) {
+            if (teammates.get(i).getName().equals(name)) {
+                teammates.remove(i);
+            }
         }
     }
 
@@ -140,34 +159,52 @@ public class LeoTeamRobot extends TeamRobot {
     //  Ledaren och målval
     // ======================================================================
 
-    /** Ledarens senaste position, eller null om han är död eller inte med i laget. */
-    private Point2D.Double findLeader() {
-        for (Map.Entry<String, Point2D.Double> entry : teammates.entrySet()) {
-            if (entry.getKey().contains(LEADER_CLASS)) {
-                return entry.getValue();
+    /** Ledaren i listan över lagkamrater, eller null om han är död. */
+    private TeammateInfo findLeader() {
+        for (TeammateInfo teammate : teammates) {
+            if (teammate.getName().contains(LEADER_NAME)) {
+                return teammate;
             }
         }
         return null;
     }
 
-    /**
-     * Lever ledaren: fienden närmast ledaren.
-     * Annars: lagets gemensamma mål (lägst energi).
-     */
-    private EnemyPosition chooseTarget(Point2D.Double leader) {
-        EnemyPosition best = null;
-        for (EnemyPosition enemy : enemies.values()) {
-            if (getTime() - enemy.time() > MAX_ENEMY_AGE) {
+    /** Vaktar vi ledaren: hotet närmast honom. Annars: lagets gemensamma mål. */
+    private EnemyInfo chooseTarget(TeammateInfo leader) {
+        if (isGuarding(leader)) {
+            return closestEnemyTo(leader.getX(), leader.getY());
+        }
+        return lowestEnergyEnemy();
+    }
+
+    /** Vaktar vi? Bara om ledaren lever och vi inte blivit träffade för många gånger. */
+    private boolean isGuarding(TeammateInfo leader) {
+        return leader != null && hitsTaken < MAX_HITS_AS_GUARD;
+    }
+
+    private EnemyInfo closestEnemyTo(double x, double y) {
+        EnemyInfo closest = null;
+        for (EnemyInfo enemy : enemies) {
+            if (enemy.isOlderThan(getTime(), MAX_ENEMY_AGE)) {
                 continue;
             }
-            if (best == null) {
-                best = enemy;
-            } else if (leader != null) {
-                if (leader.distance(enemy.x(), enemy.y()) < leader.distance(best.x(), best.y())) {
-                    best = enemy;
-                }
-            } else if (enemy.energy() < best.energy()
-                    || (enemy.energy() == best.energy() && enemy.name().compareTo(best.name()) < 0)) {
+            if (closest == null || enemy.distanceTo(x, y) < closest.distanceTo(x, y)) {
+                closest = enemy;
+            }
+        }
+        return closest;
+    }
+
+    /** Lagets gemensamma regel: motståndaren med lägst energi (vid lika energi: namnet). */
+    private EnemyInfo lowestEnergyEnemy() {
+        EnemyInfo best = null;
+        for (EnemyInfo enemy : enemies) {
+            if (enemy.isOlderThan(getTime(), MAX_ENEMY_AGE)) {
+                continue;
+            }
+            if (best == null || enemy.getEnergy() < best.getEnergy()
+                    || (enemy.getEnergy() == best.getEnergy()
+                        && enemy.getName().compareTo(best.getName()) < 0)) {
                 best = enemy;
             }
         }
@@ -175,126 +212,144 @@ public class LeoTeamRobot extends TeamRobot {
     }
 
     // ======================================================================
-    //  Sikte och rörelse
+    //  Skjutning
     // ======================================================================
 
-    private void aimAndFire(EnemyPosition target) {
-        double distance = Point2D.distance(getX(), getY(), target.x(), target.y());
-
+    /** Hårt på nära håll, svagt långt bort. Sparar energi när vi själva har lite kvar. */
+    private double choosePower(double distance) {
         double power = Math.min(3.0, 500 / distance);
         power = Math.min(power, getEnergy() / 10);
-        power = Math.max(0.1, power);
-        double bulletSpeed = 20 - 3 * power;
+        return Math.max(0.1, power);
+    }
 
-        Point2D.Double aimPoint = new Point2D.Double(target.x(), target.y());
-        for (int i = 0; i < 10; i++) {
-            double flightTime = Point2D.distance(getX(), getY(), aimPoint.x, aimPoint.y) / bulletSpeed;
-            double ticks = (getTime() - target.time()) + flightTime;
-            aimPoint = predictPosition(target, ticks);
-        }
+    private void aimAndFire(EnemyInfo target) {
+        double distance = target.distanceTo(getX(), getY());
+        double power = choosePower(distance);
 
-        boolean gunReady = getGunHeat() == 0
-                && Math.abs(getGunTurnRemainingRadians()) < Math.atan(18 / distance) + 0.05;
+        double flightTime = distance / (20 - 3 * power);
+        double ticks = (getTime() - target.getLastSeen()) + flightTime;
+        double aimX = predictX(target, ticks);
+        double aimY = predictY(target, ticks);
 
-        if (gunReady && getEnergy() > 0.2 && !teammateInLineOfFire(aimPoint.x, aimPoint.y)) {
+        if (getGunHeat() == 0 && Math.abs(getGunTurnRemaining()) < 10
+                && !isTeammateInLineOfFire(aimX, aimY)) {
             setFire(power);
         }
-
-        double angleToAim = Math.atan2(aimPoint.x - getX(), aimPoint.y - getY());
-        setTurnGunRightRadians(Utils.normalRelativeAngle(angleToAim - getGunHeadingRadians()));
+        setTurnGunRight(Utils.normalRelativeAngleDegrees(angleTo(aimX, aimY) - getGunHeading()));
     }
 
-    private Point2D.Double predictPosition(EnemyPosition enemy, double ticks) {
-        double x = enemy.x() + Math.sin(enemy.heading()) * enemy.velocity() * ticks;
-        double y = enemy.y() + Math.cos(enemy.heading()) * enemy.velocity() * ticks;
-        x = Math.max(18, Math.min(getBattleFieldWidth() - 18, x));
-        y = Math.max(18, Math.min(getBattleFieldHeight() - 18, y));
-        return new Point2D.Double(x, y);
+    private double predictX(EnemyInfo enemy, double ticks) {
+        double x = enemy.getX() + Math.sin(Math.toRadians(enemy.getHeading())) * enemy.getVelocity() * ticks;
+        return Math.max(18, Math.min(getBattleFieldWidth() - 18, x));
     }
 
-    /**
-     * Livvaktens rörelse: håll dig nära ledaren, helst på den sida där hotet finns,
-     * så att du står mellan ledaren och fienden.
-     */
-    private void guard(Point2D.Double leader, EnemyPosition threat) {
-        // Var vill vi stå? GUARD_DISTANCE från ledaren, i riktning mot hotet.
-        double guardX = leader.x;
-        double guardY = leader.y;
-        if (threat != null) {
-            double angleToThreat = Math.atan2(threat.x() - leader.x, threat.y() - leader.y);
-            guardX += Math.sin(angleToThreat) * GUARD_DISTANCE;
-            guardY += Math.cos(angleToThreat) * GUARD_DISTANCE;
-        }
-
-        double distanceToSpot = Point2D.distance(getX(), getY(), guardX, guardY);
-
-        if (distanceToSpot > 40) {
-            // Kör till platsen. Kortaste svängen: framåt eller bakåt.
-            double angleToSpot = Math.atan2(guardX - getX(), guardY - getY());
-            double turn = Utils.normalRelativeAngle(angleToSpot - getHeadingRadians());
-            if (Math.abs(turn) > Math.PI / 2) {
-                turn = Utils.normalRelativeAngle(turn + Math.PI);
-                setAhead(-distanceToSpot);
-            } else {
-                setAhead(distanceToSpot);
-            }
-            setTurnRightRadians(turn);
-        } else {
-            // Framme: rör dig lite fram och tillbaka så att du inte står helt stilla.
-            if (Math.random() < 0.1) {
-                moveDirection = -moveDirection;
-            }
-            setAhead(40 * moveDirection);
-        }
+    private double predictY(EnemyInfo enemy, double ticks) {
+        double y = enemy.getY() + Math.cos(Math.toRadians(enemy.getHeading())) * enemy.getVelocity() * ticks;
+        return Math.max(18, Math.min(getBattleFieldHeight() - 18, y));
     }
 
-    /** Om ledaren är död: cirkla runt målet som en vanlig krigare. */
-    private void circle(EnemyPosition target) {
-        if (Math.random() < 0.05) {
-            moveDirection = -moveDirection;
-        }
-        double angleToTarget = Math.atan2(target.x() - getX(), target.y() - getY());
-        double desiredHeading = angleToTarget + Math.PI / 2 - 0.25 * moveDirection;
-        setTurnRightRadians(Utils.normalRelativeAngle(desiredHeading - getHeadingRadians()));
-        setAhead(120 * moveDirection);
-    }
-
-    private boolean avoidWalls() {
-        double width = getBattleFieldWidth();
-        double height = getBattleFieldHeight();
-        boolean nearWall = getX() < WALL_MARGIN || getX() > width - WALL_MARGIN
-                || getY() < WALL_MARGIN || getY() > height - WALL_MARGIN;
-
-        if (!nearWall) {
-            return false;
-        }
-
-        double angleToCenter = Math.atan2(width / 2 - getX(), height / 2 - getY());
-        setTurnRightRadians(Utils.normalRelativeAngle(angleToCenter - getHeadingRadians()));
-        moveDirection = 1;
-        setAhead(100);
-        return true;
-    }
-
-    // ======================================================================
-    //  Friendly fire och meddelanden
-    // ======================================================================
-
-    private boolean teammateInLineOfFire(double targetX, double targetY) {
+    private boolean isTeammateInLineOfFire(double targetX, double targetY) {
         Line2D.Double lineOfFire = new Line2D.Double(getX(), getY(), targetX, targetY);
-        for (Point2D.Double teammate : teammates.values()) {
-            if (lineOfFire.ptSegDist(teammate) < TEAMMATE_SAFETY_DISTANCE) {
+        for (TeammateInfo teammate : teammates) {
+            if (lineOfFire.ptSegDist(teammate.getX(), teammate.getY()) < SAFETY_DISTANCE) {
                 return true;
             }
         }
         return false;
     }
 
-    private void sendToTeam(java.io.Serializable message) {
+    // ======================================================================
+    //  Rörelse
+    // ======================================================================
+
+    private void move(TeammateInfo leader, EnemyInfo target) {
+        if (isNearWall()) {
+            turnTowardCenter();
+        } else if (isGuarding(leader)) {
+            guard(leader, target);
+        } else if (target != null) {
+            circleAround(target);
+        } else {
+            setTurnRight(20);
+            setAhead(50);
+        }
+    }
+
+    /** Ställ dig GUARD_DISTANCE från ledaren, mellan honom och hotet. */
+    private void guard(TeammateInfo leader, EnemyInfo threat) {
+        double spotX = leader.getX();
+        double spotY = leader.getY();
+        if (threat != null) {
+            // Vinkeln (radianer) från ledaren till hotet.
+            double angle = Math.atan2(threat.getX() - leader.getX(), threat.getY() - leader.getY());
+            spotX += Math.sin(angle) * GUARD_DISTANCE;
+            spotY += Math.cos(angle) * GUARD_DISTANCE;
+        }
+        goTo(spotX, spotY);
+    }
+
+    /**
+     * Kör till en punkt. Ligger punkten bakom oss backar vi dit i stället för
+     * att vända hela roboten, det går snabbare.
+     */
+    private void goTo(double x, double y) {
+        double distance = Math.hypot(x - getX(), y - getY());
+        if (distance < 40) {
+            // Framme: rör dig lite fram och tillbaka så att du inte står helt stilla.
+            setAhead(40 * moveDirection);
+            return;
+        }
+
+        double turn = Utils.normalRelativeAngleDegrees(angleTo(x, y) - getHeading());
+        if (Math.abs(turn) > 90) {
+            turn = Utils.normalRelativeAngleDegrees(turn + 180);
+            setAhead(-distance);
+        } else {
+            setAhead(distance);
+        }
+        setTurnRight(turn);
+    }
+
+    /** Om vi inte vaktar: kör i sidled runt målet som en vanlig krigare. */
+    private void circleAround(EnemyInfo target) {
+        if (Math.random() < 0.05) {
+            reverseDirection();
+        }
+        double heading = angleTo(target.getX(), target.getY()) + 90;
+        setTurnRight(Utils.normalRelativeAngleDegrees(heading - getHeading()));
+        setAhead(120 * moveDirection);
+    }
+
+    private boolean isNearWall() {
+        return getX() < WALL_MARGIN || getX() > getBattleFieldWidth() - WALL_MARGIN
+                || getY() < WALL_MARGIN || getY() > getBattleFieldHeight() - WALL_MARGIN;
+    }
+
+    private void turnTowardCenter() {
+        double center = angleTo(getBattleFieldWidth() / 2, getBattleFieldHeight() / 2);
+        setTurnRight(Utils.normalRelativeAngleDegrees(center - getHeading()));
+        moveDirection = 1;
+        setAhead(100);
+    }
+
+    private void reverseDirection() {
+        moveDirection = -moveDirection;
+    }
+
+    // ======================================================================
+    //  Hjälpmetoder
+    // ======================================================================
+
+    /** Vinkeln (grader, 0 = norr) från vår robot till en punkt. */
+    private double angleTo(double x, double y) {
+        return Math.toDegrees(Math.atan2(x - getX(), y - getY()));
+    }
+
+    private void shareWithTeam(Serializable message) {
         try {
             broadcastMessage(message);
         } catch (IOException ex) {
-            ex.printStackTrace(out);
+            out.println("Kunde inte skicka meddelande: " + ex.getMessage());
         }
     }
 }
